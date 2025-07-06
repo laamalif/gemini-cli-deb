@@ -1,0 +1,132 @@
+name: Build Gemini CLI .deb and Release
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-version:
+    name: Check if release is needed
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.determine-version.outputs.version }}
+      skip: ${{ steps.check-release.outputs.skip }}
+    steps:
+      - name: Determine latest upstream version from npm
+        id: determine-version
+        run: |
+          LATEST_VERSION=$(curl -sL https://registry.npmjs.org/@google/gemini-cli | jq -r '."dist-tags".latest')
+          
+          if [[ -z "$LATEST_VERSION" ]]; then
+            echo "::error::Could not determine latest version from npm registry."
+            exit 1
+          fi
+          
+          echo "Latest upstream version: $LATEST_VERSION"
+          echo "version=$LATEST_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if GitHub Release already exists
+        id: check-release
+        run: |
+          VERSION=${{ steps.determine-version.outputs.version }}
+          TAG_NAME="v$VERSION"
+          
+          echo "Checking for existing GitHub Release with tag '$TAG_NAME'..."
+
+          # No authentication needed for public repos
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG_NAME}")
+
+          if [[ "$HTTP_STATUS" -eq 200 ]]; then
+            echo "✅ Release '$TAG_NAME' already exists. No action needed."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          elif [[ "$HTTP_STATUS" -eq 404 ]]; then
+            echo "ℹ️ Release '$TAG_NAME' does not exist. Proceeding to build."
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "::error::Unexpected HTTP status code '$HTTP_STATUS' received from GitHub API."
+            exit 1
+          fi
+
+  build-and-release:
+    name: Build and Release .deb
+    needs: check-version
+    if: needs.check-version.outputs.skip == 'false'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    container:
+      image: node:20-bookworm
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ruby-dev build-essential wget
+          gem install --no-document fpm
+
+      - name: Set version and filenames
+        run: |
+          VERSION=${{ needs.check-version.outputs.version }}
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          echo "PKG_NAME=google-gemini-cli" >> $GITHUB_ENV
+          echo "DEB_FILENAME=google-gemini-cli_${VERSION}_all.deb" >> $GITHUB_ENV
+          echo "TGZ_FILENAME=gemini-cli-${VERSION}.tgz" >> $GITHUB_ENV
+
+      - name: Download gemini-cli tarball
+        run: wget -q "https://registry.npmjs.org/@google/gemini-cli/-/${{ env.TGZ_FILENAME }}"
+
+      - name: Prepare staging directory
+        run: |
+          rm -rf pkgdir
+          mkdir -p pkgdir/usr
+
+      - name: npm install into staging directory
+        run: npm install --global --prefix="$PWD/pkgdir/usr" ./${{ env.TGZ_FILENAME }}
+
+      - name: Build .deb with fpm
+        run: |
+          fpm -s dir -t deb \
+            -n "${{ env.PKG_NAME }}" \
+            -v "${{ env.VERSION }}" \
+            -a all \
+            -C pkgdir/usr \
+            --prefix /usr \
+            --description "An open-source AI agent that brings the power of Gemini to your terminal." \
+            --url "https://github.com/google-gemini/gemini-cli" \
+            --license "Apache-2.0" \
+            --maintainer "laamalif@github.io" \
+            .
+
+      - name: Compute checksums
+        run: |
+          sha256sum ${{ env.DEB_FILENAME }} > ${{ env.DEB_FILENAME }}.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}
+          body: |
+            Automated Debian Package for [gemini-cli](https://github.com/google-gemini/gemini-cli) version ${{ env.VERSION }}.
+            
+            ## Installation
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/v${{ env.VERSION }}/${{ env.DEB_FILENAME }}
+            sudo dpkg -i ${{ env.DEB_FILENAME }}
+            ```
+            
+            ## Checksum
+            To verify the download:
+            ```bash
+            sha256sum -c ${{ env.DEB_FILENAME }}.sha256
+            ```
+          files: |
+            ${{ env.DEB_FILENAME }}
+            ${{ env.DEB_FILENAME }}.sha256
